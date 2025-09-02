@@ -5,26 +5,29 @@ from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.helpers import escape_markdown
 
-from api.fact_check_api import search_fact_check
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# claim_detector.py
+from transformers import pipeline
 
-# Load model
+# Load transformer model
 classifier = pipeline("text-classification", model="Pulk17/Fake-News-Detection")
 
 # Map model labels to human-readable outputs
 label_mapping = {
-    "LABEL_0": "fake",
-    "LABEL_1": "real",
-    "LABEL_2": "not sure, check again from verified sources"  
+    "LABEL_0": "FAKE",
+    "LABEL_1": "REAL",
+    "LABEL_2": "UNCERTAIN"
 }
 
 def is_potential_fake(text: str) -> dict:
+    """
+    Predict whether the input text is likely fake, real, or uncertain.
+    Returns prediction and confidence score.
+    """
     result = classifier(text)[0]
-    human_label = label_mapping.get(result["label"], "unknown")  # map LABEL_X to real/fake/maybe
+    human_label = label_mapping.get(result["label"], "UNCERTAIN")
     return {
         "prediction": human_label,
-        "confidence": round(float(result["score"]), 4)
+        "confidence": float(result["score"])
     }
 
 if __name__ == "__main__":

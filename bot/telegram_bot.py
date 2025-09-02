@@ -1,82 +1,167 @@
-#BOT_TOKEN = "7676108205:AAF9oKzkm8IiM28QdXDMstBEzjrstvI9pXc"
-import warnings
-import sys
 import os
+import warnings
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
 from telegram.helpers import escape_markdown
-
-# Suppress scheduler warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="apscheduler")
-
-# Add root path so we can import local modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-# Import claim detection + fact-check search
+import wikipediaapi
+from sentence_transformers import SentenceTransformer, util
 from model.claim_detector import is_potential_fake
 from api.fact_check_api import search_fact_check
+from serpapi import GoogleSearch
 
-# 🔐 Bot Token (get from environment variable for security)
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7676108205:AAF9oKzkm8IiM28QdXDMstBEzjrstvI9pXc")
+# -----------------------
+# Suppress warnings
+# -----------------------
+warnings.filterwarnings("ignore", category=UserWarning, module="apscheduler")
 
-# Start command handler
+# -----------------------
+# Load environment variables
+# -----------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+
+if not BOT_TOKEN:
+    print("❌ TELEGRAM_BOT_TOKEN not set in environment variables")
+    exit()
+
+if not SERPAPI_API_KEY:
+    print("❌ SERPAPI_API_KEY not set in environment variables")
+    # You can choose to continue without web search
+
+# -----------------------
+# Initialize Wikipedia API
+# -----------------------
+wiki_wiki = wikipediaapi.Wikipedia(
+    language='en',
+    user_agent='ai-fact-checker-bot/1.0 (https://github.com/yourusername/yourrepo)'
+)
+
+# -----------------------
+# Semantic similarity model
+# -----------------------
+sim_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# -----------------------
+# Helper: Wikipedia check
+# -----------------------
+def check_wikipedia_claim(claim: str) -> str:
+    """Check a claim against Wikipedia and return real/maybe real/maybe fake."""
+    page = wiki_wiki.page(claim)
+    if page.exists():
+        return "real"
+    # fallback: check individual words
+    for word in claim.split():
+        page = wiki_wiki.page(word)
+        if page.exists():
+            return "maybe real"
+    return "maybe fake"
+
+# -----------------------
+# Helper: Google search for web verification
+# -----------------------
+def search_web_articles(query: str, num_results: int = 5):
+    if not SERPAPI_API_KEY:
+        return []
+
+    params = {
+        "q": query,
+        "api_key": SERPAPI_API_KEY,
+        "engine": "google",
+        "num": num_results,
+        "hl": "en"
+    }
+
+    try:
+        search = GoogleSearch(params)
+        results = search.get_dict()
+        articles = []
+
+        for item in results.get("organic_results", []):
+            articles.append({
+                "title": item.get("title"),
+                "snippet": item.get("snippet"),
+                "url": item.get("link")
+            })
+        return articles
+    except Exception as e:
+        print(f"Error fetching web articles: {e}")
+        return []
+
+# -----------------------
+# Start command
+# -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome to AI Fact Checker. Send me a message to verify it!")
+    await update.message.reply_text(
+        "👋 Welcome to AI Fact Checker Bot!\nSend me a news/article text to verify."
+    )
 
+# -----------------------
 # Fact-check handler
-async def fact_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text.strip()
-
-    if not user_message:
-        await update.message.reply_text("❗ Please send a text message.")
+# -----------------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    if not user_text:
+        await update.message.reply_text("❗ Please send some text to check.")
         return
 
-    # 🧠 Run model prediction
-    prediction = is_potential_fake(user_message)
-    label = prediction["label"]
-    score = round(prediction["score"] * 100, 2)
+    # 1️⃣ Model prediction
+    model_result = is_potential_fake(user_text)
+    model_pred = model_result["prediction"]
+    model_conf = model_result["confidence"]
 
-    # 🔎 Run fact-check API
-    fact_info = search_fact_check(user_message)
+    # 2️⃣ Wikipedia check
+    wiki_pred = check_wikipedia_claim(user_text)
 
-    # Map label to status message
-    if label.upper() == "FAKE":
-        status = "⚠️ *Fake News Detected!*"
-    elif label.upper() == "REAL":
-        status = "✅ *Likely Real Information*"
+    # 3️⃣ Multi-source fact-check (optional API)
+    fact_results = []
+    try:
+        api_fact = search_fact_check(user_text)
+        if api_fact:
+            fact_results.append(f"📰 *Official Fact Check:* {api_fact}")
+    except Exception:
+        pass
+
+    # 4️⃣ Web search + semantic similarity
+    claim_emb = sim_model.encode(user_text)
+    for article in search_web_articles(user_text, num_results=5)[:3]:
+        article_emb = sim_model.encode(article["snippet"])
+        similarity = util.cos_sim(claim_emb, article_emb).item()
+        if similarity > 0.65:
+            fact_results.append(
+                f"📰 *Web Article:* {article['title']} ({similarity*100:.1f}% match)\n{article['url']}"
+            )
+
+    # 5️⃣ Combine Wikipedia + Model + Web sources for final label
+    if wiki_pred == "real":
+        final_label = "real"
     else:
-        status = "❔ *Uncertain - Needs Verification*"
+        if model_pred.lower() == "fake":
+            final_label = "fake" if model_conf > 0.8 else "maybe fake"
+        elif model_pred.lower() == "real":
+            final_label = "real" if model_conf > 0.8 else "maybe real"
+        else:
+            final_label = "maybe"
 
-    confidence = f"📊 *Confidence Score:* {score}%"
+    # 6️⃣ Confidence display
+    combined_conf = min(1.0, model_conf + len(fact_results)*0.1)
 
-    if fact_info:
-        fact_summary = f"📰 _Fact-check Summary:_\n{fact_info}"
-    else:
-        fact_summary = "_No official fact-check found._"
+    # 7️⃣ Prepare reply (Markdown-safe)
+    reply_text = f"*Prediction:* {escape_markdown(final_label, version=2)}\n*Confidence:* {combined_conf:.2f}"
+    if fact_results:
+        reply_text += "\n\n" + "\n\n".join([escape_markdown(fr, version=2) for fr in fact_results])
 
-    # Combine into final reply
-    reply = f"{status}\n{confidence}\n\n{fact_summary}"
+    await update.message.reply_text(reply_text, parse_mode="MarkdownV2")
 
-    # Escape Markdown for Telegram
-    escaped_reply = escape_markdown(reply, version=2)
+# -----------------------
+# Build application
+# -----------------------
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    await update.message.reply_text(escaped_reply, parse_mode=ParseMode.MARKDOWN_V2)
-
-# Main function
-def run_bot():
-    if BOT_TOKEN == "7676108205:AAF9oKzkm8IiM28QdXDMstBEzjrstvI9pXc":
-        print("❌ BOT_TOKEN not set. Please set TELEGRAM_BOT_TOKEN in environment.")
-        return
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fact_check))
-
-    print("✅ Telegram bot is running...")
-    app.run_polling()
-
+# -----------------------
 # Run bot
+# -----------------------
 if __name__ == "__main__":
-    run_bot()
+    print("✅ AI Fact Checker Bot is running...")
+    application.run_polling()
