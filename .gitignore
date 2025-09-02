@@ -1,1 +1,35 @@
 venv/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# VS Code settings
+.vscode/
+
+# MacOS system files
+.DS_Store
+
+# Logs
+*.log
+
+# Python profiler data
+.prof
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
